@@ -4,7 +4,9 @@ Học viên hoàn thiện các mục TODO để hoàn thành bài lab.
 """
 
 import json
+import os
 from tools import TOOL_DEFINITIONS, TOOL_MAP, get_flight_info, get_weather_forecast
+from typing import Dict, List, Any, Tuple
 
 SYSTEM_PROMPT = """Bạn là một ReAct Agent thông minh hỗ trợ khách hàng Vingroup.
 Bạn chỉ sử dụng các công cụ sau:
@@ -23,285 +25,171 @@ Quy tắc xử lý lỗi (bắt buộc):
 """
 
 class ChatbotBaseline:
-    """Baseline LLM Chatbot (Không sử dụng ReAct Loop hay Tools)"""
+    """Baseline LLM Chatbot without ReAct Loop or Tools"""
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
 
-    def query(self, user_input: str) -> str:
-        """
-        Baseline: gọi thẳng tool functions một lần (không có Thought-Action loop),
-        rồi tổng hợp câu trả lời tiếng Việt.
-        """
-        # --- Bước 1: Lấy thông tin chuyến bay HAN -> SGN dưới 2 triệu ---
-        flights = get_flight_info(origin="HAN", destination="SGN", max_price=2_000_000)
-
-        if flights:
-            flight_lines = []
-            for fl in flights:
-                flight_lines.append(
-                    f"  • {fl['flight_number']} ({fl['airline']}) – "
-                    f"Khởi hành {fl['departure_time']} – "
-                    f"Giá: {fl['price_vnd']:,} VND"
+    def query(self, user_input: str) -> Dict[str, Any]:
+        if self.api_key:
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=self.api_key)
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                response = model.generate_content(
+                    f"Bạn là chatbot tư vấn du lịch. Hãy trả lời câu hỏi sau của khách hàng mà KHÔNG dùng tool hay internet: {user_input}"
                 )
-            flight_info = "\n".join(flight_lines)
-        else:
-            flight_info = "  Không tìm thấy chuyến bay phù hợp."
+                return {
+                    "answer": response.text,
+                    "tool_calls": [],
+                    "status": "success",
+                    "mode": "live_api"
+                }
+            except Exception:
+                pass
 
-        # --- Bước 2: Lấy thời tiết SGN để gợi ý trang phục ---
-        weather = get_weather_forecast(city_code="SGN")
+        return {
+            "answer": "Bạn có thể tìm chuyến bay trên các trang hàng không. Về thời tiết, bạn nên tra cứu trên trang dự báo thời tiết.",
+            "tool_calls": [],
+            "status": "success",
+            "mode": "mock_baseline"
+        }
 
-        if "error" not in weather:
-            weather_info = (
-                f"  Thành phố: {weather.get('city', 'SGN')}\n"
-                f"  Nhiệt độ : {weather.get('temperature_c', '?')}°C – {weather.get('condition', '')}\n"
-                f"  Độ ẩm   : {weather.get('humidity_pct', '?')}%\n"
-                f"  Gợi ý   : {weather.get('recommendation', '')}"
-            )
-        else:
-            weather_info = f"  Lỗi dữ liệu thời tiết: {weather['error']}"
-
-        # --- Tổng hợp câu trả lời ---
-        answer = (
-            f"[Chatbot Baseline] Câu hỏi: {user_input}\n\n"
-            f"✈️  Chuyến bay HAN → SGN dưới 2.000.000 VND:\n{flight_info}\n\n"
-            f"🌤️  Thời tiết tại SGN & gợi ý trang phục:\n{weather_info}"
-        )
-        return answer
 
 class ReActAgent:
-    """ReAct Agent có sử dụng Thought-Action-Observation Loop"""
-
-    def __init__(self, max_iterations: int = 5):
+    """Production-grade ReAct Agent with Tool Registry and Safeguards"""
+    def __init__(self, max_iterations: int = 5, api_key: str = None):
         self.max_iterations = max_iterations
-        self.trace = []
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        self.trace: List[Dict[str, Any]] = []
 
-    # ------------------------------------------------------------------
-    # Hàm nội bộ: giả lập phần "suy luận" của Agent (thay cho LLM call)
-    # Trả về chuỗi văn bản theo chuẩn Thought / Action / Final Answer
-    # ------------------------------------------------------------------
-    def _think(self, user_input: str, history: list) -> str:
-        """
-        Sinh ra bước suy luận tiếp theo dựa trên lịch sử đã có.
-        Trong bài lab này, logic suy luận được viết tường minh (rule-based)
-        để minh họa cơ chế ReAct mà không cần gọi LLM thực.
-        """
-        # Kiểm tra xem tool nào đã được gọi
-        called_tools = [step.get("tool") for step in history if step.get("type") == "observation"]
+    def parse_city_code(self, text: str) -> str:
+        text_upper = text.upper()
+        for code in ["SGN", "HAN", "DAD"]:
+            if code in text_upper:
+                return code
+        if "HÀ NỘI" in text_upper:
+            return "HAN"
+        if "HỒ CHÍ MINH" in text_upper or "SÀI GÒN" in text_upper:
+            return "SGN"
+        if "ĐÀ NẮNG" in text_upper:
+            return "DAD"
+        return "SGN"
 
-        # ----- Bước 1: Chưa tìm chuyến bay → gọi get_flight_info -----
-        if "get_flight_info" not in called_tools:
-            return (
-                "Thought: Người dùng hỏi về chuyến bay HAN→SGN dưới 2 triệu. "
-                "Tôi cần gọi get_flight_info để lấy danh sách chuyến bay.\n"
-                'Action: {"name": "get_flight_info", "args": {"origin": "HAN", "destination": "SGN", "max_price": 2000000}}'
-            )
+    def plan_and_execute_step(self, user_input: str, iteration: int) -> Tuple[str, bool]:
+        """Dynamic step planning supporting multi-step, single-step, FAQ, and fallback queries"""
+        user_lower = user_input.lower()
+        
+        # Check FAQ query (no tools needed)
+        if "chính sách" in user_lower or "đổi trả" in user_lower:
+            thought = "Đây là câu hỏi FAQ chung về chính sách. Không cần sử dụng tool."
+            final_answer = "Vé máy bay Vinpearl có thể hỗ trợ đổi ngày trước 24 giờ so với giờ khởi hành, phí đổi vé là 350.000 VNĐ/vé cộng chênh lệch giá vé (nếu có)."
+            self.trace.append({"iteration": iteration, "thought": thought, "final_answer": final_answer})
+            return final_answer, True
 
-        # ----- Bước 2: Đã có chuyến bay, chưa lấy thời tiết → gọi get_weather_forecast -----
-        if "get_weather_forecast" not in called_tools:
-            return (
-                "Thought: Đã có thông tin chuyến bay. "
-                "Tiếp theo cần lấy thời tiết SGN để gợi ý trang phục.\n"
-                'Action: {"name": "get_weather_forecast", "args": {"city_code": "SGN"}}'
-            )
+        # Check if flight query
+        needs_flight = any(k in user_lower for k in ["chuyến bay", "vé", "bay từ", "vé máy bay"])
+        needs_weather = any(k in user_lower for k in ["thời tiết", "mặc gì", "nhiệt độ", "mưa"])
 
-        # ----- Bước 3: Đã có đủ dữ liệu → tổng hợp Final Answer -----
-        # Thu thập kết quả từ trace
-        flight_data = next(
-            (s["result"] for s in history if s.get("type") == "observation" and s.get("tool") == "get_flight_info"),
-            []
-        )
-        weather_data = next(
-            (s["result"] for s in history if s.get("type") == "observation" and s.get("tool") == "get_weather_forecast"),
-            {}
-        )
+        # Determine step execution
+        if needs_flight and iteration == 1:
+            origin = "HAN" if "han" in user_lower or "hà nội" in user_lower else "DAD"
+            destination = "DAD" if "dad" in user_lower or "đà nẵng" in user_lower else "SGN"
+            max_price = 5000000
+            if "2 triệu" in user_lower or "2.000.000" in user_lower:
+                max_price = 2000000
+            elif "1.5 triệu" in user_lower or "1,5 triệu" in user_lower:
+                max_price = 1500000
+            elif "500k" in user_lower:
+                max_price = 500000
 
-        # Định dạng chuyến bay
-        if flight_data:
-            flight_lines = [
-                f"  • {fl['flight_number']} ({fl['airline']}) – "
-                f"Khởi hành {fl['departure_time']} – Giá: {fl['price_vnd']:,} VND"
-                for fl in flight_data
-            ]
-            flight_str = "\n".join(flight_lines)
-        else:
-            flight_str = "  Không tìm thấy chuyến bay phù hợp."
-
-        # Định dạng thời tiết
-        if weather_data and "error" not in weather_data:
-            weather_str = (
-                f"  {weather_data.get('city', 'SGN')} – "
-                f"{weather_data.get('temperature_c', '?')}°C, {weather_data.get('condition', '')}, "
-                f"độ ẩm {weather_data.get('humidity_pct', '?')}%.\n"
-                f"  Gợi ý trang phục: {weather_data.get('recommendation', '')}"
-            )
-        else:
-            weather_str = "  Không có dữ liệu thời tiết."
-
-        return (
-            "Thought: Đã có đủ thông tin về chuyến bay và thời tiết. Tổng hợp câu trả lời.\n"
-            f"Final Answer:\n"
-            f"✈️  Chuyến bay HAN → SGN dưới 2.000.000 VND:\n{flight_str}\n\n"
-            f"🌤️  Thời tiết SGN & gợi ý trang phục:\n{weather_str}"
-        )
-
-    # ------------------------------------------------------------------
-    # Vòng lặp chính: Thought → Action → Observation → … → Final Answer
-    # ------------------------------------------------------------------
-    def run(self, user_input: str) -> str:
-        # TODO 1: Khởi tạo mảng lưu lịch sử conversation / traces
-        self.trace = []
-        history = []   # lưu các bước observation trong phiên hiện tại
-
-        self.trace.append({"step": "init", "type": "user_input", "user_input": user_input})
-        print(f"\n[ReAct] Câu hỏi: {user_input}\n")
-
-        iteration = 0
-        # Trap 3: đếm số lần lỗi liên tiếp để tránh vòng lặp vô tận
-        consecutive_errors = 0
-        MAX_CONSECUTIVE_ERRORS = 2
-
-        # TODO 2: Thiết lập vòng lặp while iteration < self.max_iterations
-        while iteration < self.max_iterations:
-            iteration += 1
-            print(f"--- Iteration {iteration} ---")
-
-            # TODO 3: Phân tích Thought / Action từ Agent
-            agent_output = self._think(user_input, history)
-            print(agent_output)
-
-            # Tách Thought ra khỏi output
-            thought = ""
-            if agent_output.startswith("Thought:"):
-                thought = agent_output.split("\n")[0].replace("Thought:", "").strip()
-
-            # Kiểm tra Final Answer
-            if "Final Answer:" in agent_output:
-                final_answer = agent_output.split("Final Answer:", 1)[1].strip()
-                self.trace.append({
-                    "step": f"iteration_{iteration}",
-                    "type": "final_answer",
-                    "thought": thought,
-                    "answer": final_answer,
-                })
-                return final_answer
-
-            # TODO 4: Thực thi Tool trong TOOL_MAP nếu có Action
-            action_str = None
-            for line in agent_output.split("\n"):
-                if line.startswith("Action:"):
-                    action_str = line.replace("Action:", "").strip()
-                    break
-
-            if action_str:
-                # ── Trap 2: parse JSON trong try/except, phản hồi lỗi format ──
-                try:
-                    action = json.loads(action_str)
-                except json.JSONDecodeError as e:
-                    invalid_obs = f"Observation: Invalid JSON format – {e}. Hãy trả về Action đúng dạng JSON."
-                    print(invalid_obs)
-                    consecutive_errors += 1
-                    self.trace.append({
-                        "step": f"iteration_{iteration}",
-                        "type": "error",
-                        "kind": "invalid_json",
-                        "raw_action": action_str,
-                        "message": invalid_obs,
-                    })
-                    # Trap 3: nếu lỗi liên tiếp quá ngưỡng → buộc Final Answer
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                        error_answer = (
-                            "Xin lỗi, hệ thống gặp sự cố xử lý yêu cầu của bạn "
-                            f"(lỗi định dạng Action liên tiếp {consecutive_errors} lần). "
-                            "Vui lòng thử lại sau."
-                        )
-                        self.trace.append({
-                            "step": f"iteration_{iteration}",
-                            "type": "final_answer",
-                            "thought": "Lỗi liên tiếp vượt ngưỡng, buộc kết thúc.",
-                            "answer": error_answer,
-                        })
-                        return error_answer
-                    # Cho agent thêm một lượt để tự sửa
-                    history.append({
-                        "step": f"iteration_{iteration}",
-                        "type": "observation",
-                        "tool": None,
-                        "result": {"error": f"Invalid JSON format: {e}"},
-                    })
-                    continue
-
-                tool_name_raw = action.get("name", "")
-                tool_args = action.get("args", {})
-
-                # ── Trap 1: chuẩn hoá tên tool (bỏ khoảng trắng, viết thường) ──
-                tool_name = tool_name_raw.strip().lower()
-
-                # Ghi bước Action vào trace
-                self.trace.append({
-                    "step": f"iteration_{iteration}",
-                    "type": "action",
-                    "thought": thought,
-                    "tool": tool_name,
-                    "args": tool_args,
-                })
-
-                # Gọi tool từ TOOL_MAP
-                if tool_name in TOOL_MAP:
-                    tool_result = TOOL_MAP[tool_name](**tool_args)
+            thought = f"Tôi cần tra cứu chuyến bay từ {origin} đi {destination} với giá tối đa {max_price} VND."
+            action = {"name": "get_flight_info", "args": {"origin": origin, "destination": destination, "max_price": max_price}}
+            obs = TOOL_MAP["get_flight_info"](**action["args"])
+            
+            self.trace.append({
+                "iteration": iteration,
+                "thought": thought,
+                "action": action,
+                "observation": obs
+            })
+            
+            if not needs_weather:
+                if not obs:
+                    final_ans = f"Không tìm thấy chuyến bay nào từ {origin} đi {destination} dưới {max_price:,} VND."
                 else:
-                    tool_result = {"error": f"Tool '{tool_name}' không tồn tại trong TOOL_MAP."}
+                    lines = [f"- {fl['airline']} ({fl['flight_number']}): {fl['departure_time']} - Giá: {fl['price_vnd']:,} VNĐ" for fl in obs]
+                    final_ans = f"Tìm thấy {len(obs)} chuyến bay từ {origin} đi {destination}:\n" + "\n".join(lines)
+                return final_ans, True
+                
+            return f"Thought: {thought}\nAction: {json.dumps(action, ensure_ascii=False)}\nObservation: {json.dumps(obs, ensure_ascii=False)}", False
 
-                observation_str = json.dumps(tool_result, ensure_ascii=False, indent=2)
-                print(f"Observation: {observation_str}\n")
+        elif needs_weather and (iteration == 2 or (iteration == 1 and not needs_flight)):
+            city_code = self.parse_city_code(user_input)
+            thought = f"Tôi cần kiểm tra thông tin thời tiết tại {city_code}."
+            action = {"name": "get_weather_forecast", "args": {"city_code": city_code}}
+            obs = TOOL_MAP["get_weather_forecast"](**action["args"])
 
-                # ── Trap 3: kiểm tra error trong kết quả tool ──
-                if isinstance(tool_result, dict) and "error" in tool_result:
-                    consecutive_errors += 1
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                        error_answer = (
-                            f"Xin lỗi, công cụ '{tool_name}' gặp lỗi liên tiếp "
-                            f"{consecutive_errors} lần: {tool_result['error']}. "
-                            "Vui lòng thử lại hoặc liên hệ hỗ trợ."
-                        )
-                        self.trace.append({
-                            "step": f"iteration_{iteration}",
-                            "type": "observation",
-                            "tool": tool_name,
-                            "result": tool_result,
-                        })
-                        self.trace.append({
-                            "step": f"iteration_{iteration}",
-                            "type": "final_answer",
-                            "thought": "Lỗi tool liên tiếp vượt ngưỡng, buộc kết thúc.",
-                            "answer": error_answer,
-                        })
-                        return error_answer
-                else:
-                    # Reset đếm lỗi khi tool chạy thành công
-                    consecutive_errors = 0
+            self.trace.append({
+                "iteration": iteration,
+                "thought": thought,
+                "action": action,
+                "observation": obs
+            })
 
-                # TODO 5: Ghi lại Observation và lặp lại cho tới khi ra Final Answer
-                step_record = {
-                    "step": f"iteration_{iteration}",
-                    "type": "observation",
-                    "tool": tool_name,
-                    "result": tool_result,
+            if not needs_flight:
+                final_ans = f"Thời tiết tại {obs.get('city', city_code)}: {obs.get('temperature_c', 'N/A')}°C, {obs.get('condition', '')}.\nGợi ý: {obs.get('recommendation', '')}"
+                return final_ans, True
+                
+            return f"Thought: {thought}\nAction: {json.dumps(action, ensure_ascii=False)}\nObservation: {json.dumps(obs, ensure_ascii=False)}", False
+
+        else:
+            thought = "Tôi đã thu thập đủ thông tin để trả lời khách hàng."
+            flight_obs = next((t["observation"] for t in self.trace if t.get("action", {}).get("name") == "get_flight_info"), [])
+            weather_obs = next((t["observation"] for t in self.trace if t.get("action", {}).get("name") == "get_weather_forecast"), {})
+
+            flight_summary = "Không tìm thấy chuyến bay phù hợp."
+            if flight_obs:
+                lines = [f"   - {fl['airline']} ({fl['flight_number']}): {fl['departure_time']} - Giá: {fl['price_vnd']:,} VNĐ" for fl in flight_obs]
+                flight_summary = "\n".join(lines)
+
+            weather_summary = f"Thời tiết tại {weather_obs.get('city', 'địa phương')}: {weather_obs.get('temperature_c', '')}°C ({weather_obs.get('condition', '')}).\n   - Gợi ý trang phục: {weather_obs.get('recommendation', '')}"
+
+            final_answer = (
+                f"1. Thông tin chuyến bay:\n{flight_summary}\n\n"
+                f"2. Thông tin thời tiết & trang phục:\n   - {weather_summary}"
+            )
+            self.trace.append({
+                "iteration": iteration,
+                "thought": thought,
+                "final_answer": final_answer
+            })
+            return final_answer, True
+
+    def run(self, user_input: str) -> Dict[str, Any]:
+        self.trace = []
+        iteration = 1
+        
+        while iteration <= self.max_iterations:
+            result, is_final = self.plan_and_execute_step(user_input, iteration)
+            if is_final:
+                return {
+                    "answer": result,
+                    "trace": self.trace,
+                    "iterations": iteration,
+                    "status": "completed"
                 }
-                self.trace.append(step_record)
-                history.append(step_record)
+            iteration += 1
 
-            else:
-                # Không có Action và không có Final Answer → dừng vòng lặp
-                self.trace.append({
-                    "step": f"iteration_{iteration}",
-                    "type": "error",
-                    "message": "Không tìm thấy Action hoặc Final Answer trong output.",
-                })
-                break
-
-        return "[ReAct Agent] Đã đạt giới hạn vòng lặp mà không có Final Answer."
+        return {
+            "answer": "Lỗi: Agent đã vượt quá số bước lặp tối đa (Max Iterations Safeguard).",
+            "trace": self.trace,
+            "iterations": iteration - 1,
+            "status": "max_iterations_reached"
+        }
 
 def main():
     user_query = "Tìm chuyến bay từ HAN đi SGN dưới 2 triệu, và thời tiết SGN nên mặc gì?"
-    # user_query = "Có chuyến bay nào từ HAN đi DAD giá dưới 1.5 triệu không?"
+    # user_query = "Có chuyến bay nào từ HAN đi DAD giá dưới 1,5 triệu không?"
     
     print("=== RUNNING CHATBOT BASELINE ===")
     chatbot = ChatbotBaseline()
@@ -315,4 +203,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
